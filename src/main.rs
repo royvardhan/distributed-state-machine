@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     io,
     sync::Arc,
+    time::Duration,
 };
 
 use tokio::{
@@ -9,6 +10,7 @@ use tokio::{
     net::TcpListener,
     spawn,
     sync::{mpsc, Mutex},
+    time::sleep,
 };
 
 use uuid::Uuid;
@@ -116,6 +118,108 @@ impl Node {
             }
         }
     }
+
+    async fn wait_for_acknowledgements(&self, proposal_id: String) {
+        let majority = (self.peers.len() / 2) + 1;
+
+        loop {
+            let ack_count = {
+                let acks = self.proposal_acknowledgement.lock().await;
+                acks.get(&proposal_id).map(|acks| acks.len()).unwrap()
+            };
+
+            if ack_count >= majority {
+                // Commit the proposal
+                break;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    }
 }
 
-fn main() {}
+async fn simulate_client_interaction() -> io::Result<()> {
+    let mut stream = TcpStream::connect("127.0.0.1:8080").await.unwrap(); // Connect to Node 1
+    let proposal_message = Message {
+        sender_id: 999,
+        message_type: MessageType::Proposal,
+        proposed_state: State::Running,
+        proposal_id: Uuid::new_v4().to_string(),
+    };
+
+    let serialized_message = serde_json::to_vec(&proposal_message).unwrap();
+    stream.write_all(&serialized_message).await.unwrap();
+    stream.flush().await?; // Ensure the message is sent immediately
+    println!("Simulated client sent proposal to Node 1");
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() {
+    let state = Arc::new(Mutex::new(State::Init));
+    let proposal_acknowledgments = Arc::new(Mutex::new(HashMap::new()));
+
+    let (sender1, receiver1) = mpsc::channel(32);
+
+    let node1 = Arc::new(Node {
+        id: 1,
+        state: state.clone(),
+        peers: HashMap::from([(2, "0.0.0.0:8081".to_string())]),
+        tx: sender1,
+        address: "0.0.0.0:8080".to_string(),
+        proposal_acknowledgement: proposal_acknowledgments.clone(),
+    });
+
+    let (sender2, receiver2) = mpsc::channel(32);
+
+    let node2 = Arc::new(Node {
+        id: 2,
+        state: state.clone(),
+        peers: HashMap::from([(1, "0.0.0.0:8080".to_string())]),
+        tx: sender2,
+        address: "0.0.0.0:8081".to_string(),
+        proposal_acknowledgement: proposal_acknowledgments,
+    });
+
+    let node1_clone_for_messages = Arc::clone(&node1);
+    spawn(async move {
+        node1_clone_for_messages
+            .handle_incoming_messages(receiver1)
+            .await;
+    });
+
+    let node2_clone_for_messages = Arc::clone(&node1);
+    spawn(async move {
+        node2_clone_for_messages
+            .handle_incoming_messages(receiver2)
+            .await;
+    });
+
+    // Listen for incoming connections
+    let node1_clone_for_listen = Arc::clone(&node1);
+    tokio::spawn(async move {
+        node1_clone_for_listen
+            .listen()
+            .await
+            .expect("Node 1 failed to listen");
+    });
+
+    let node2_clone_for_listen = Arc::clone(&node2);
+    tokio::spawn(async move {
+        node2_clone_for_listen
+            .listen()
+            .await
+            .expect("Node 2 failed to listen");
+    });
+
+    // Ensure the servers have time to start up
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    // Use the original `node1` Arc to broadcast a proposal
+    node1.broadcast_proposal(State::Running).await;
+
+    // Start the simulation after a short delay to ensure nodes are listening
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    if let Err(e) = simulate_client_interaction().await {
+        eprintln!("Failed to simulate client: {:?}", e);
+    }
+}
