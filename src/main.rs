@@ -68,7 +68,7 @@ impl Node {
         proposal_acknowledgement.insert(proposal_id.clone(), HashSet::new());
 
         for address in self.peers.values() {
-            if let Err(e) = self.send_message(&message, &address) {
+            if let Err(e) = self.send_message(&message, &address).await {
                 eprintln!("Failed to send message to {}: {:?}", address, e);
             };
         }
@@ -84,7 +84,7 @@ impl Node {
             let (mut socket, _) = listener.accept().await?;
             let tx = self.tx.clone();
             spawn(async move {
-                let mut buf = [0u8, 1024];
+                let mut buf = [0u8; 1024];
                 loop {
                     match socket.read(&mut buf).await {
                         Ok(0) => break, // Connection closed,
